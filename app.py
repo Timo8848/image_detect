@@ -12,7 +12,7 @@ from skimage.transform import resize as sk_resize
 from streamlit_drawable_canvas import st_canvas
 from torchvision import datasets
 
-from src import preprocess, visualize
+from src import gestures, preprocess, visualize
 from src.inference import MNIST_CLASSES, compute_saliency, forward_with_artifacts
 from src.model import load_lenet
 
@@ -25,6 +25,7 @@ KERNEL_OPTIONS = [3, 5]
 FILTER_OPTIONS = [6, 12, 16]
 STRIDE_OPTIONS = [1, 2]
 PADDING_OPTIONS = [0, 1, 2]
+EXPR_HISTORY_LIMIT = 8
 
 LAYER_EXPLANATIONS = {
     "conv": "Convolution slides a small kernel across the image. The kernel size controls how big the patch is. Stride tells us how far we move the kernel each step, while padding adds a border of zeros so edges get seen.",
@@ -61,6 +62,11 @@ def _ensure_state():
         "inference": None,
         "saliency": None,
         "model_mode": "Pretrained",
+        "expression_tokens": [],
+        "calc_result": None,
+        "calc_error": None,
+        "calc_history": [],
+        "last_eval_expr": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -143,6 +149,42 @@ def _plot_topk(result) -> tuple[str, float]:
     data = pd.DataFrame({"Digit": labels, "Probability": values})
     st.bar_chart(data.set_index("Digit"))
     return labels[0], float(values[0])
+
+
+def _expression_tokens() -> list[str]:
+    return st.session_state["expression_tokens"]
+
+
+def _record_history(expression: str, result: float) -> None:
+    history = st.session_state["calc_history"]
+    history.insert(0, {"Expression": expression, "Result": result})
+    if len(history) > EXPR_HISTORY_LIMIT:
+        history.pop()
+
+
+def _append_symbol(prediction: gestures.SymbolPrediction) -> Optional[str]:
+    tokens = _expression_tokens()
+    symbol = prediction.label
+    if prediction.kind == "operator":
+        if not tokens:
+            return "Start with a digit before adding an operator."
+        if tokens[-1] in gestures.OPERATOR_SYMBOLS:
+            return "Two operators cannot be adjacent."
+    tokens.append(symbol)
+    return None
+
+
+def _pop_symbol() -> None:
+    tokens = _expression_tokens()
+    if tokens:
+        tokens.pop()
+
+
+def _clear_expression() -> None:
+    st.session_state["expression_tokens"] = []
+    st.session_state["calc_result"] = None
+    st.session_state["calc_error"] = None
+    st.session_state["last_eval_expr"] = None
 
 
 def main() -> None:
@@ -238,6 +280,11 @@ def main() -> None:
     else:
         st.info("Start by drawing a digit and clicking Classify.")
 
+    gesture_prediction = None
+    if inference_result and prep_result is not None:
+        probs_tensor = inference_result.probs[0] if inference_result.probs.ndim == 2 else inference_result.probs
+        gesture_prediction = gestures.classify_gesture(prep_result.processed_image, probs_tensor)
+
     if inference_result:
         st.subheader("Prediction readout")
         top_label, top_prob = _plot_topk(inference_result)
@@ -293,6 +340,72 @@ def main() -> None:
             }
         )
         st.dataframe(timeline, use_container_width=True, hide_index=True)
+
+    if gesture_prediction:
+        st.subheader("Gesture-driven calculator")
+        st.caption("Add each gesture to the expression builder to evaluate handwritten equations.")
+        info_cols = st.columns(3)
+        with info_cols[0]:
+            st.metric("Interpreted symbol", gesture_prediction.label,
+                      delta=gesture_prediction.kind.capitalize())
+        with info_cols[1]:
+            st.metric("Symbol confidence", f"{gesture_prediction.confidence:.2f}")
+        with info_cols[2]:
+            st.metric("Digit confidence", f"{gesture_prediction.digit_prob:.2f}")
+
+        operator_scores = {
+            symbol: gesture_prediction.operator_scores.get(symbol, 0.0) for symbol in gestures.OPERATOR_SYMBOLS
+        }
+        scores_df = pd.DataFrame(
+            {"Operator": list(operator_scores.keys()), "Score": list(operator_scores.values())}
+        )
+        st.dataframe(scores_df, hide_index=True, use_container_width=True)
+
+        tokens = _expression_tokens()
+        expression_display = gestures.expression_from_tokens(tokens)
+        st.caption("Current expression")
+        st.code(expression_display if expression_display else "…", language="text")
+
+        button_cols = st.columns(3)
+        with button_cols[0]:
+            if st.button("Add to expression", type="primary"):
+                error = _append_symbol(gesture_prediction)
+                if error:
+                    st.warning(error)
+        with button_cols[1]:
+            st.button("Backspace", disabled=not tokens, on_click=_pop_symbol)
+        with button_cols[2]:
+            st.button("Clear expression", disabled=not tokens, on_click=_clear_expression)
+
+        preview_value, preview_error = gestures.evaluate_tokens(tokens) if tokens else (None, "Expression is empty.")
+        if preview_error:
+            st.info(preview_error)
+        elif preview_value is not None:
+            st.success(f"Preview result: {preview_value}")
+
+        eval_cols = st.columns([1, 1])
+        with eval_cols[0]:
+            if st.button("Evaluate expression", disabled=not tokens):
+                if preview_error:
+                    st.warning(preview_error)
+                else:
+                    expr = gestures.expression_from_tokens(tokens)
+                    st.session_state["calc_result"] = float(preview_value)
+                    st.session_state["calc_error"] = None
+                    st.session_state["last_eval_expr"] = expr
+                    _record_history(expr, float(preview_value))
+                    st.success(f"{expr} = {preview_value}")
+        with eval_cols[1]:
+            last_expr = st.session_state.get("last_eval_expr")
+            last_result = st.session_state.get("calc_result")
+            if last_expr and last_result is not None:
+                st.metric("Last result", f"{last_expr} = {last_result}")
+
+        history = st.session_state["calc_history"]
+        if history:
+            st.caption("Recent calculations")
+            hist_df = pd.DataFrame(history)
+            st.dataframe(hist_df, hide_index=True, use_container_width=True)
 
     _render_sidebar(*sidebar_payload)
 
